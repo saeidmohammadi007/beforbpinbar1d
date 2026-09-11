@@ -8,7 +8,9 @@ import requests
 import ccxt
 
 FAST, SLOW = 12, 26
-PATTERN_START, PATTERN_END = '2015-02-02', '2016-08-08'
+# تاریخ الگوی مرجع (روزانه) — DD/MM/YYYY → ISO
+PATTERN_START, PATTERN_END = '2025-05-08', '2025-07-06'
+REFERENCE_SYMBOL = 'XTZ-USD'   # نماد الگوی مرجع
 SHOW_N = 10
 
 # ---------- توابع ----------
@@ -38,8 +40,9 @@ def get_lbank_futures_symbols():
     print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
     return unique_bases
 
-def get_weekly_data(ticker):
-    df = yf.download(ticker, start='2015-01-01', interval='1wk', progress=False, auto_adjust=False)
+def get_daily_data(ticker):
+    """داده‌ی روزانه برای الگوی مرجع"""
+    df = yf.download(ticker, start='2024-01-01', interval='1d', progress=False, auto_adjust=False)
     if df.empty:
         return None
     df = df[['Open', 'High', 'Low', 'Close']].copy()
@@ -98,17 +101,21 @@ def send_telegram_message(text):
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
 # ---------- اجرای اصلی ----------
-print("🔍 استخراج الگوی هفتگی بیت‌کوین ...")
-btc_w = get_weekly_data('BTC-USD')
-if btc_w is None:
-    print("❌ خطا در دریافت داده‌های بیت‌کوین")
+print(f"🔍 استخراج الگوی روزانه {REFERENCE_SYMBOL} ...")
+ref_d = get_daily_data(REFERENCE_SYMBOL)
+if ref_d is None:
+    print(f"❌ خطا در دریافت داده‌های {REFERENCE_SYMBOL}")
     exit()
 
-btc_macd = macd_line(btc_w['close']).dropna()
-mask = (btc_macd.index >= PATTERN_START) & (btc_macd.index <= PATTERN_END)
-pattern = btc_macd[mask].values
+ref_macd = macd_line(ref_d['close']).dropna()
+mask = (ref_macd.index >= PATTERN_START) & (ref_macd.index <= PATTERN_END)
+pattern = ref_macd[mask].values
 L = len(pattern)
-print(f"✅ الگوی مرجع (هفتگی) با {L} کندل")
+print(f"✅ الگوی مرجع (روزانه) با {L} کندل")
+
+if L < 2:
+    print("❌ الگوی مرجع خیلی کوتاه است.")
+    exit()
 
 pattern_mean = np.mean(pattern)
 pattern_std = np.std(pattern) + 1e-9
@@ -160,8 +167,8 @@ if results:
 
     # ساخت پیام متنی برای تلگرام
     message_lines = []
-    message_lines.append("🏆 <b>برترین ارزهای مشابه الگوی BTC (فقط DTW)</b>\n")
-    message_lines.append("(MACD ۳۰ دقیقه‌ای در برابر الگوی هفتگی 2015-2016 با محدودیت Sakoe-Chiba)\n")
+    message_lines.append(f"🏆 <b>برترین ارزهای مشابه الگوی روزانه {REFERENCE_SYMBOL} (فقط DTW)</b>\n")
+    message_lines.append(f"(MACD ۳۰ دقیقه‌ای در برابر الگوی روزانه {PATTERN_START} تا {PATTERN_END} با محدودیت Sakoe-Chiba)\n")
     for idx, row in df_top.iterrows():
         line = (
             f"🔸 <b>{row['symbol']}</b>\n"
