@@ -7,11 +7,10 @@ import time
 import requests
 import ccxt
 
-FAST, SLOW = 12, 26
-# تاریخ الگوی مرجع (روزانه) — DD/MM/YYYY → ISO
-PATTERN_START, PATTERN_END = '2025-05-08', '2025-07-06'
-REFERENCE_SYMBOL = 'XTZ-USD'   # نماد الگوی مرجع
-SHOW_N = 10
+# --- الگوی مرجع: تک‌کندل روزانه BTC ---
+PATTERN_SYMBOL = 'BTC-USD'
+PATTERN_DATE   = '2024-01-23'   # تاریخ کندل الگو
+SHOW_N         = 10
 
 # ---------- توابع ----------
 def get_lbank_futures_symbols():
@@ -31,8 +30,7 @@ def get_lbank_futures_symbols():
             continue
         base_list.append(base.upper())
 
-    seen = set()
-    unique_bases = []
+    seen, unique_bases = set(), []
     for b in base_list:
         if b not in seen:
             seen.add(b)
@@ -40,9 +38,9 @@ def get_lbank_futures_symbols():
     print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
     return unique_bases
 
-def get_daily_data(ticker):
-    """داده‌ی روزانه برای الگوی مرجع"""
-    df = yf.download(ticker, start='2024-01-01', interval='1d', progress=False, auto_adjust=False)
+def get_daily_data(ticker, start='2024-01-01'):
+    df = yf.download(ticker, start=start, interval='1d',
+                     progress=False, auto_adjust=False)
     if df.empty:
         return None
     df = df[['Open', 'High', 'Low', 'Close']].copy()
@@ -50,34 +48,17 @@ def get_daily_data(ticker):
     df.columns = ['open', 'high', 'low', 'close']
     return df
 
-def get_30m_data(ticker):
-    df = yf.download(ticker, period='60d', interval='30m', progress=False, auto_adjust=False)
-    if df.empty:
+def candle_vector(o, h, l, c):
+    """تبدیل کندل به بردار ۴ بعدی نرمال‌شده بین 0 و 1 (نسبت به دامنه‌ی کندل)."""
+    rng = float(h - l)
+    if rng <= 0 or not np.isfinite(rng):
         return None
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
-    return df
-
-def macd_line(close_series):
-    ema_fast = close_series.ewm(span=FAST, adjust=False).mean()
-    ema_slow = close_series.ewm(span=SLOW, adjust=False).mean()
-    return ema_fast - ema_slow
-
-def dtw_distance(x, y, window=None):
-    n = len(x)
-    dtw = np.full((n+1, n+1), np.inf)
-    dtw[0, 0] = 0.0
-    for i in range(1, n+1):
-        if window is None:
-            j_start, j_end = 1, n
-        else:
-            j_start = max(1, i - window)
-            j_end = min(n, i + window)
-        for j in range(j_start, j_end+1):
-            cost = (x[i-1] - y[j-1]) ** 2
-            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
-    return np.sqrt(dtw[n, n])
+    return np.array([
+        (float(o) - float(l)) / rng,   # موقعیت Open
+        1.0,                           # High (بالاترین نقطه)
+        0.0,                           # Low  (پایین‌ترین نقطه)
+        (float(c) - float(l)) / rng,   # موقعیت Close
+    ])
 
 def send_telegram_message(text):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -86,11 +67,7 @@ def send_telegram_message(text):
         print("❌ توکن یا chat_id تنظیم نشده است.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': 'HTML'
-    }
+    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
     try:
         r = requests.post(url, data=payload, timeout=10)
         if r.status_code != 200:
@@ -101,87 +78,82 @@ def send_telegram_message(text):
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
 # ---------- اجرای اصلی ----------
-print(f"🔍 استخراج الگوی روزانه {REFERENCE_SYMBOL} ...")
-ref_d = get_daily_data(REFERENCE_SYMBOL)
-if ref_d is None:
-    print(f"❌ خطا در دریافت داده‌های {REFERENCE_SYMBOL}")
+print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} ...")
+ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
+if ref_daily is None:
+    print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
     exit()
 
-ref_macd = macd_line(ref_d['close']).dropna()
-mask = (ref_macd.index >= PATTERN_START) & (ref_macd.index <= PATTERN_END)
-pattern = ref_macd[mask].values
-L = len(pattern)
-print(f"✅ الگوی مرجع (روزانه) با {L} کندل")
-
-if L < 2:
-    print("❌ الگوی مرجع خیلی کوتاه است.")
+target_date = pd.to_datetime(PATTERN_DATE).date()
+mask = ref_daily.index.date == target_date
+if not mask.any():
+    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
+    print(f"تاریخ‌های موجود: {list(ref_daily.index.date)}")
     exit()
 
-pattern_mean = np.mean(pattern)
-pattern_std = np.std(pattern) + 1e-9
-pat_norm = (pattern - pattern_mean) / pattern_std
+candle = ref_daily[mask].iloc[0]
+o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+pattern_vec = candle_vector(o, h, l, c)
+if pattern_vec is None:
+    print("❌ کندل مرجع نامعتبر است.")
+    exit()
 
-WINDOW = max(1, int(0.5 * L))
-print(f"🔹 پنجره DTW (Sakoe-Chiba): {WINDOW}")
+print(f"📌 کندل مرجع: O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
+print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
+      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
 
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
-top_symbols = get_lbank_futures_symbols()
-
-if len(top_symbols) == 0:
+symbols = get_lbank_futures_symbols()
+if not symbols:
     print("❌ هیچ نمادی برای اسکن وجود ندارد!")
     exit()
 
 results = []
-for sym in tqdm(top_symbols, desc="اسکن ۳۰ دقیقه‌ای"):
+for sym in tqdm(symbols, desc="اسکن کندل روزانه"):
     try:
-        df_30m = get_30m_data(f"{sym}-USD")
-        if df_30m is None or len(df_30m) < L + 30:
+        df_d = get_daily_data(f"{sym}-USD", start='2024-01-01')
+        if df_d is None or len(df_d) < 1:
             continue
 
-        macd = macd_line(df_30m['close']).dropna()
-        if len(macd) < L:
+        last = df_d.iloc[-1]
+        vec = candle_vector(last['open'], last['high'],
+                            last['low'],  last['close'])
+        if vec is None:
             continue
 
-        current = macd.iloc[-L:].values
-        cur_mean = np.mean(current)
-        cur_std = np.std(current) + 1e-9
-        cur_norm = (current - cur_mean) / cur_std
+        # فاصله‌ی اقلیدسی بین بردارها (کمترین = شبیه‌ترین)
+        dist = float(np.linalg.norm(pattern_vec - vec))
 
-        dist_dtw = dtw_distance(pat_norm, cur_norm, window=WINDOW)
-
-        last_time = macd.index[-1].strftime('%Y-%m-%d %H:%M')
         results.append({
-            'symbol': sym,
-            'dist_dtw': dist_dtw,
-            'last_30m': last_time
+            'symbol':    sym,
+            'dist':      dist,
+            'last_date': df_d.index[-1].strftime('%Y-%m-%d'),
+            'o': float(last['open']),
+            'h': float(last['high']),
+            'l': float(last['low']),
+            'c': float(last['close']),
         })
         time.sleep(0.3)
     except Exception:
         continue
 
 if results:
-    df_res = pd.DataFrame(results)
+    df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
-    # رتبه‌بندی فقط بر اساس DTW (کمترین = بهترین)
-    df_top = df_res.sort_values('dist_dtw').head(SHOW_N)
-
-    # ساخت پیام متنی برای تلگرام
-    message_lines = []
-    message_lines.append(f"🏆 <b>برترین ارزهای مشابه الگوی روزانه {REFERENCE_SYMBOL} (فقط DTW)</b>\n")
-    message_lines.append(f"(MACD ۳۰ دقیقه‌ای در برابر الگوی روزانه {PATTERN_START} تا {PATTERN_END} با محدودیت Sakoe-Chiba)\n")
-    for idx, row in df_top.iterrows():
-        line = (
-            f"🔸 <b>{row['symbol']}</b>\n"
-            f"   DTW: {row['dist_dtw']:.4f} | بروزرسانی: {row['last_30m']}\n"
+    lines = []
+    lines.append(f"🏆 <b>کندل‌های روزانه مشابه الگوی {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
+    lines.append(f"الگو: O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}\n")
+    for _, row in df_res.iterrows():
+        lines.append(
+            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
+            f"   تاریخ: {row['last_date']} | "
+            f"O={row['o']:.6g} H={row['h']:.6g} "
+            f"L={row['l']:.6g} C={row['c']:.6g}"
         )
-        message_lines.append(line)
-    message_lines.append(f"\n📅 تعداد کل ارزهای اسکن‌شده: {len(top_symbols)}")
-    message = "\n".join(message_lines)
+    lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
+    message = "\n".join(lines)
 
-    # ارسال به تلگرام
     send_telegram_message(message)
-
-    # چاپ در لاگ هم برای بررسی
     print("\n" + message)
 else:
     print("\n❌ نتیجه‌ای یافت نشد.")
