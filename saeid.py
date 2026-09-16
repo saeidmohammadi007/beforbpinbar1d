@@ -7,13 +7,10 @@ import time
 import requests
 import ccxt
 
-SHOW_N = 20
-
-# ---------- پارامترهای تشخیص چکش معکوس سبز ----------
-BODY_MAX_RATIO     = 0.35   # بدنه حداکثر ۳۵٪ دامنه
-UPPER_MIN_RATIO    = 0.50   # سایه بالایی حداقل ۵۰٪ دامنه
-UPPER_BODY_MULT    = 2.0    # سایه بالایی حداقل ۲ برابر بدنه
-LOWER_MAX_RATIO    = 0.15   # سایه پایینی حداکثر ۱۵٪ دامنه
+# --- الگوی مرجع: تک‌کندل روزانه BTC ---
+PATTERN_SYMBOL = 'BTC-USD'
+PATTERN_DATE   = '2024-02-05'
+SHOW_N         = 10
 
 # ---------- توابع ----------
 def get_lbank_futures_symbols():
@@ -41,60 +38,28 @@ def get_lbank_futures_symbols():
     print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
     return unique_bases
 
-def get_4h_data(ticker):
-    df = yf.download(ticker, period='60d', interval='1h',
+def get_daily_data(ticker, start='2024-01-01'):
+    """داده‌ی روزانه"""
+    df = yf.download(ticker, start=start, interval='1d',
                      progress=False, auto_adjust=False)
     if df.empty:
         return None
     df = df[['Open', 'High', 'Low', 'Close']].copy()
     df.index = pd.to_datetime(df.index)
     df.columns = ['open', 'high', 'low', 'close']
+    return df
 
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-
-    df_4h = df.resample('4h').agg({
-        'open':  'first',
-        'high':  'max',
-        'low':   'min',
-        'close': 'last',
-    }).dropna()
-    return df_4h
-
-def detect_green_inverted_hammer(o, h, l, c):
-    """
-    اگر کندل «چکش معکوس سبز» بود، دیکشنری نسبت‌ها برمی‌گرداند، وگرنه None.
-    """
+def candle_vector(o, h, l, c):
+    """بردار ۴بعدی نرمال‌شده‌ی کندل نسبت به دامنه High−Low"""
     rng = float(h - l)
     if rng <= 0 or not np.isfinite(rng):
         return None
-
-    # 🟢 سبز بودن
-    if c <= o:
-        return None
-
-    body       = c - o
-    upper_wick = h - c
-    lower_wick = o - l
-
-    body_r  = body / rng
-    upper_r = upper_wick / rng
-    lower_r = lower_wick / rng
-
-    if body_r  > BODY_MAX_RATIO:                    return None
-    if upper_r < UPPER_MIN_RATIO:                   return None
-    if upper_wick < UPPER_BODY_MULT * body:         return None
-    if lower_r > LOWER_MAX_RATIO:                   return None
-    if lower_wick > body:                           return None
-
-    # امتیاز کیفیت: هرچه سایه بالایی بلندتر و بدنه کوچک‌تر => بهتر
-    score = upper_r - body_r
-    return {
-        'body_ratio':  body_r,
-        'upper_ratio': upper_r,
-        'lower_ratio': lower_r,
-        'score':       score,
-    }
+    return np.array([
+        (float(o) - float(l)) / rng,
+        1.0,
+        0.0,
+        (float(c) - float(l)) / rng,
+    ])
 
 def send_telegram_message(text):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -114,7 +79,28 @@ def send_telegram_message(text):
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
 # ---------- اجرای اصلی ----------
-print("🔎 جستجوی الگوی «چکش معکوس سبز» در کندل ۴ ساعته (قبلی)...")
+print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
+ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
+if ref_daily is None:
+    print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
+    exit()
+
+target_date = pd.to_datetime(PATTERN_DATE).date()
+mask = ref_daily.index.date == target_date
+if not mask.any():
+    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
+    exit()
+
+candle = ref_daily[mask].iloc[0]
+o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+pattern_vec = candle_vector(o, h, l, c)
+if pattern_vec is None:
+    print("❌ کندل مرجع نامعتبر است.")
+    exit()
+
+print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
+print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
+      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
 
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
 symbols = get_lbank_futures_symbols()
@@ -123,49 +109,45 @@ if not symbols:
     exit()
 
 results = []
-for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
+for sym in tqdm(symbols, desc="اسکن کندل روزانه (قبلی)"):
     try:
-        df_4h = get_4h_data(f"{sym}-USD")
-        if df_4h is None or len(df_4h) < 3:
+        df_1d = get_daily_data(f"{sym}-USD", start='2024-01-01')
+        if df_1d is None or len(df_1d) < 2:   # ✅ حداقل ۲ کندل لازم است
             continue
 
-        prev = df_4h.iloc[-2]     # کندل بسته‌شده‌ی قبلی
-        o, h, l, c = (float(prev['open']),  float(prev['high']),
-                      float(prev['low']),   float(prev['close']))
-
-        info = detect_green_inverted_hammer(o, h, l, c)
-        if info is None:
+        prev = df_1d.iloc[-2]                  # ✅ کندل یکی قبل از آخرین (روز قبل)
+        vec = candle_vector(prev['open'], prev['high'],
+                            prev['low'],  prev['close'])
+        if vec is None:
             continue
+
+        dist = float(np.linalg.norm(pattern_vec - vec))
 
         results.append({
             'symbol':   sym,
-            'score':    info['score'],
-            'body_r':   info['body_ratio'],
-            'upper_r':  info['upper_ratio'],
-            'lower_r':  info['lower_ratio'],
-            'time_4h':  df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
-            'o': o, 'h': h, 'l': l, 'c': c,
+            'dist':     dist,
+            'last_1d':  df_1d.index[-2].strftime('%Y-%m-%d'),  # ✅ تاریخ کندل قبلی
+            'o': float(prev['open']),
+            'h': float(prev['high']),
+            'l': float(prev['low']),
+            'c': float(prev['close']),
         })
         time.sleep(0.3)
     except Exception:
         continue
 
 if results:
-    df_res = pd.DataFrame(results).sort_values('score', ascending=False).head(SHOW_N)
+    df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
     lines = []
-    lines.append(f"🕯 <b>کندل‌های ۴ ساعته‌ی «چکش معکوس سبز» (کندل قبلی)</b>\n")
-    lines.append(
-        f"معیار: بدنه≤{BODY_MAX_RATIO:.0%} | سایه‌بالا≥{UPPER_MIN_RATIO:.0%} و "
-        f"≥{UPPER_BODY_MULT:g}× بدنه | سایه‌پایین≤{LOWER_MAX_RATIO:.0%}\n"
-    )
+    lines.append(f"🏆 <b>کندل‌های روزانه (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
+    lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}\n")
     for _, row in df_res.iterrows():
         lines.append(
-            f"🟢 <b>{row['symbol']}</b>  (امتیاز: {row['score']:.3f})\n"
-            f"   زمان ۴h: {row['time_4h']}\n"
-            f"   O={row['o']:.6g} H={row['h']:.6g} L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   بدنه={row['body_r']:.2f}  سایه‌بالا={row['upper_r']:.2f}  "
-            f"سایه‌پایین={row['lower_r']:.2f}"
+            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
+            f"   تاریخ 1d: {row['last_1d']} | "
+            f"O={row['o']:.6g} H={row['h']:.6g} "
+            f"L={row['l']:.6g} C={row['c']:.6g}"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
@@ -173,7 +155,7 @@ if results:
     send_telegram_message(message)
     print("\n" + message)
 else:
-    print("\n❌ هیچ چکش معکوس سبزی یافت نشد.")
-    send_telegram_message("❌ در اسکن امروز هیچ «چکش معکوس سبزی» یافت نشد.")
+    print("\n❌ نتیجه‌ای یافت نشد.")
+    send_telegram_message("❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد.")
 
 print("\n✅ اسکن کامل شد!")
